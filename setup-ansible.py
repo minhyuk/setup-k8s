@@ -105,8 +105,7 @@ class AnsibleSetup:
             # 필요한 패키지 설치 전에 NOPASSWD 설정 추가
             commands = [
                 "sudo apt-get update",
-                "sudo apt-get install -y python3-pip sshpass",
-                "pip3 install --user ansible",
+                "sudo apt-get install -y python3-pip sshpass ansible",
                 'echo "export PATH=$PATH:$HOME/.local/bin" >> ~/.bashrc',
                 "source ~/.bashrc"
             ]
