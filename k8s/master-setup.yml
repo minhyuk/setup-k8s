@@ -71,10 +71,33 @@
           - kubectl={{ kubernetes_version }}
         state: present
 
+    - name: Enable kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - overlay
+        - br_netfilter
+
+    - name: Configure kernel parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_set: yes
+        reload: yes
+      with_items:
+        - { name: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { name: "net.ipv4.ip_forward", value: "1" }
+
     - name: Initialize Kubernetes cluster
       command: kubeadm init --pod-network-cidr={{ pod_network_cidr }}
       args:
         creates: /etc/kubernetes/admin.conf
+      become: yes
+      become_user: root
+      become_method: sudo
 
     - name: Create .kube directory
       file:
