@@ -1,0 +1,106 @@
+- name: Setup Kubernetes Worker Nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - chrony
+          - gnupg
+        state: present
+
+    - name: Configure chrony
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    - name: Disable swap
+      command: swapoff -a
+      when: disable_swap
+
+    - name: Remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        line: '# \1'
+        backrefs: yes
+
+    - name: Add NVIDIA Ubuntu 24.04 repository
+      apt_repository:
+        repo: ppa:graphics-drivers/ppa
+        state: present
+
+    - name: Install NVIDIA drivers
+      apt:
+        name: 
+          - nvidia-driver-{{ nvidia_driver_version }}
+          - nvidia-dkms-{{ nvidia_driver_version }}
+        state: present
+        update_cache: yes
+
+    - name: Add containerd apt keyring
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /etc/apt/keyrings/docker.gpg
+        state: present
+
+    - name: Add containerd repository
+      apt_repository:
+        repo: deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable
+        state: present
+        filename: docker
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+
+    - name: Configure containerd
+      shell: |
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Add Kubernetes apt keyring
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        keyring: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+        filename: kubernetes
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet={{ kubernetes_version }}
+          - kubeadm={{ kubernetes_version }}
+          - kubectl={{ kubernetes_version }}
+        state: present
+
+    - name: Copy join command
+      copy:
+        src: ./join-command
+        dest: /tmp/join-command.sh
+        mode: '0777'
+
+    - name: Join cluster
+      command: sh /tmp/join-command.sh
