@@ -344,8 +344,13 @@ class AnsibleVerification:
         """Verify sudo permissions"""
         self.logger.info("\n=== Verifying Sudo Permissions ===")
         
-        command = 'ansible all -i %s -m shell -a "sudo -n true" -b' % self.inventory_path
-        success, output = self.run_ansible_command(command)
+        # 환경변수에 sudo 비밀번호 추가
+        env = os.environ.copy()
+        if self.ssh_password:
+            env['ANSIBLE_BECOME_PASS'] = self.ssh_password
+        
+        command = f'ansible all -i {self.inventory_path} -m shell -a "sudo -n true" -b'
+        success, output = self.run_ansible_command(command, env=env)
         if not success:
             self.logger.error(f"Sudo permission verification failed: {output}")
             return False
@@ -357,8 +362,13 @@ class AnsibleVerification:
         """Python 설치 확인"""
         self.logger.info("\n=== Python 설치 확인 ===")
         
-        command = f"ansible all -i {self.inventory_path} -m shell -a 'python3 --version'"
-        success, output = self.run_ansible_command(command)
+        # 환경변수에 sudo 비밀번호 추가
+        env = os.environ.copy()
+        if self.ssh_password:
+            env['ANSIBLE_BECOME_PASS'] = self.ssh_password
+        
+        command = f"ansible all -i {self.inventory_path} -m shell -a 'python3 --version' -b"  # -b 옵션 추가
+        success, output = self.run_ansible_command(command, env=env)
         if not success:
             self.logger.error(f"Python 설치 확인 실패: {output}")
             return False
