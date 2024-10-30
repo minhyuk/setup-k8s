@@ -2,6 +2,22 @@
   hosts: workers
   become: yes
   tasks:
+    # 0. 기존 Kubernetes 설정 초기화
+    - name: Reset Kubernetes cluster
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove CNI configurations
+      file:
+        path: /etc/cni/net.d
+        state: absent
+
+    - name: Remove .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: absent
+
+    # 1. 기본 시스템 설정
     - name: Update apt cache
       apt:
         update_cache: yes
@@ -18,36 +34,42 @@
           - gnupg
         state: present
 
-    - name: Configure chrony
-      service:
-        name: chronyd
-        state: started
-        enabled: yes
+    # 2. 커널 모듈 및 시스템 설정
+    - name: Enable kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - overlay
+        - br_netfilter
+
+    - name: Configure kernel parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_set: yes
+        reload: yes
+      with_items:
+        - { name: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { name: "net.ipv4.ip_forward", value: "1" }
 
     - name: Disable swap
       command: swapoff -a
-      when: disable_swap
 
-    - name: Remove swap from fstab
-      lineinfile:
+    # 타임존 설정
+    - name: Set timezone
+      timezone:
+        name: "{{ timezone }}"
+
+    - name: Remove swap from /etc/fstab
+      replace:
         path: /etc/fstab
         regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
-        line: '# \1'
-        backrefs: yes
+        replace: '# \1'
 
-    - name: Add NVIDIA Ubuntu 24.04 repository
-      apt_repository:
-        repo: ppa:graphics-drivers/ppa
-        state: present
-
-    - name: Install NVIDIA drivers
-      apt:
-        name: 
-          - nvidia-driver-{{ nvidia_driver_version }}
-          - nvidia-dkms-{{ nvidia_driver_version }}
-        state: present
-        update_cache: yes
-
+    # 3. Containerd 설정
     - name: Add containerd apt keyring
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
@@ -65,10 +87,16 @@
         name: containerd.io
         state: present
 
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+
     - name: Configure containerd
       shell: |
         containerd config default | tee /etc/containerd/config.toml
         sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      notify: Restart containerd
 
     - name: Restart containerd
       service:
@@ -76,15 +104,16 @@
         state: restarted
         enabled: yes
 
+    # 4. Kubernetes 컴포넌트 설치
     - name: Add Kubernetes apt keyring
       apt_key:
-        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
         keyring: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
         state: present
 
     - name: Add Kubernetes repository
       apt_repository:
-        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
         state: present
         filename: kubernetes
 
@@ -96,6 +125,60 @@
           - kubectl={{ kubernetes_version }}
         state: present
 
+    # 5. Kubelet 설정
+    - name: Create kubelet configuration directory
+      file:
+        path: /var/lib/kubelet
+        state: directory
+        mode: '0755'
+
+    - name: Configure default kubelet
+      copy:
+        dest: /var/lib/kubelet/config.yaml
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+          authentication:
+            anonymous:
+              enabled: false
+          clusterDNS:
+            - "10.96.0.10"
+          clusterDomain: "cluster.local"
+          resolvConf: "/run/systemd/resolve/resolv.conf"
+          runtimeRequestTimeout: "15m"
+          failSwapOn: false
+        mode: '0644'
+
+    - name: Create systemd drop-in directory for kubelet
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure kubelet service
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        content: |
+          [Service]
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+          Environment="KUBELET_KUBEADM_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+          ExecStart=
+          ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS
+        mode: '0644'
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start kubelet
+      service:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    # 6. Join cluster
     - name: Copy join command
       copy:
         src: ./join-command
@@ -104,3 +187,14 @@
 
     - name: Join cluster
       command: sh /tmp/join-command.sh
+
+  handlers:
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        state: restarted

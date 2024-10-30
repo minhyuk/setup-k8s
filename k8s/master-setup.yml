@@ -2,6 +2,22 @@
   hosts: master
   become: yes
   tasks:
+    # 0. 기존 Kubernetes 설정 초기화
+    - name: Reset Kubernetes cluster
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove CNI configurations
+      file:
+        path: /etc/cni/net.d
+        state: absent
+
+    - name: Remove .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: absent
+
+    # 1. 기본 시스템 설정
     - name: Update apt cache
       apt:
         update_cache: yes
@@ -18,6 +34,42 @@
           - gnupg
         state: present
 
+    # 2. 커널 모듈 및 시스템 설정
+    - name: Enable kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - overlay
+        - br_netfilter
+
+    - name: Configure kernel parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_set: yes
+        reload: yes
+      with_items:
+        - { name: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { name: "net.ipv4.ip_forward", value: "1" }
+
+    - name: Disable swap
+      command: swapoff -a
+
+    # 타임존 설정
+    - name: Set timezone
+      timezone:
+        name: "{{ timezone }}"
+
+    - name: Remove swap from /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    # 3. Containerd 설정
     - name: Add containerd apt keyring
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
@@ -44,6 +96,7 @@
       shell: |
         containerd config default | tee /etc/containerd/config.toml
         sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      notify: Restart containerd
 
     - name: Restart containerd
       service:
@@ -51,6 +104,7 @@
         state: restarted
         enabled: yes
 
+    # 4. Kubernetes 컴포넌트 설치
     - name: Add Kubernetes apt keyring
       apt_key:
         url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
@@ -71,34 +125,69 @@
           - kubectl={{ kubernetes_version }}
         state: present
 
-    - name: Enable kernel modules
-      modprobe:
-        name: "{{ item }}"
-        state: present
-      with_items:
-        - overlay
-        - br_netfilter
+    # 5. Kubelet 설정
+    - name: Create kubelet configuration directory
+      file:
+        path: /var/lib/kubelet
+        state: directory
+        mode: '0755'
 
-    - name: Configure kernel parameters
-      sysctl:
-        name: "{{ item.name }}"
-        value: "{{ item.value }}"
-        state: present
-        sysctl_set: yes
-        reload: yes
-      with_items:
-        - { name: "net.bridge.bridge-nf-call-iptables", value: "1" }
-        - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
-        - { name: "net.ipv4.ip_forward", value: "1" }
+    - name: Configure default kubelet
+      copy:
+        dest: /var/lib/kubelet/config.yaml
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+          authentication:
+            anonymous:
+              enabled: false
+          clusterDNS:
+            - "10.96.0.10"
+          clusterDomain: "cluster.local"
+          resolvConf: "/run/systemd/resolve/resolv.conf"
+          runtimeRequestTimeout: "15m"
+          failSwapOn: false
+        mode: '0644'
 
+    - name: Create systemd drop-in directory for kubelet
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure kubelet service
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        content: |
+          [Service]
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+          Environment="KUBELET_KUBEADM_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-infra-container-image=registry.k8s.io/pause:3.9"
+          ExecStart=
+          ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS
+        mode: '0644'
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start kubelet
+      service:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    # 6. Kubernetes 클러스터 초기화
     - name: Initialize Kubernetes cluster
-      command: kubeadm init --pod-network-cidr={{ pod_network_cidr }}
+      command: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --apiserver-advertise-address={{ hostvars['k8s-master'].ansible_host }}
+
       args:
         creates: /etc/kubernetes/admin.conf
-      become: yes
-      become_user: root
-      become_method: sudo
+      register: kubeadm_init
 
+
+    # 7. 클러스터 설정
     - name: Create .kube directory
       file:
         path: /home/{{ ansible_user }}/.kube
@@ -111,25 +200,61 @@
         src: /etc/kubernetes/admin.conf
         dest: /home/{{ ansible_user }}/.kube/config
         remote_src: yes
+        mode: '0600'
         owner: "{{ ansible_user }}"
         group: "{{ ansible_user }}"
 
+    # 8. 네트워킹 설정
+    - name: Wait for 30 seconds before installing Calico
+      wait_for:
+        timeout: 10
+
     - name: Install Calico CNI
       become: false
-      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml --validate=false
+      register: calico_result
+      until: calico_result.rc == 0
+      retries: 3
+      delay: 10
 
+    # 9. 추가 구성요소 설치
     - name: Install Helm
       shell: |
         curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
     - name: Add NVIDIA Helm repository
       become: false
-      command: helm repo add nvidia https://nvidia.github.io/gpu-operator && helm repo update
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+
+      command: helm repo add nvidia https://nvidia.github.io/gpu-operator
+      
+    - name: Update Helm repositories
+      become: false
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      command: helm repo update
+
+    - name: Check if system has NVIDIA GPU
+      command: nvidia-smi
+      register: nvidia_smi_result
+      ignore_errors: yes
 
     - name: Install GPU Operator
       become: false
-      command: helm install gpu-operator nvidia/gpu-operator --namespace gpu-operator --create-namespace --wait
+      environment:
+        KUBECONFIG: /home/{{ ansible_user }}/.kube/config
+      command: >
+        helm install gpu-operator nvidia/gpu-operator 
+        --namespace gpu-operator 
+        --create-namespace 
+        --wait 
+        --timeout 10m
+      when: nvidia_smi_result.rc == 0
 
+    # 10. Join 커맨드 생성
     - name: Get join command
       command: kubeadm token create --print-join-command
       register: join_command
@@ -137,4 +262,13 @@
     - name: Save join command
       local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"
 
+  handlers:
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
 
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        state: restarted 
