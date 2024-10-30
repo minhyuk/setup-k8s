@@ -253,8 +253,9 @@ ansible_become_password = {self.ssh_password if self.ssh_password else ''}
             return False
         
 class AnsibleVerification:
-    def __init__(self, inventory_path: str = 'inventory.yml'):
+    def __init__(self, inventory_path: str = 'inventory.yml', ssh_password: Optional[str] = None):
         self.inventory_path = inventory_path
+        self.ssh_password = ssh_password
         self.setup_logging()
     
     def setup_logging(self):
@@ -269,7 +270,7 @@ class AnsibleVerification:
         )
         self.logger = logging.getLogger(__name__)
 
-    def run_ansible_command(self, command: str) -> tuple:
+    def run_ansible_command(self, command: str, env: Optional[Dict] = None) -> tuple:
         """Ansible 명령어 실행"""
         try:
             result = subprocess.run(
@@ -278,7 +279,8 @@ class AnsibleVerification:
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                env=env
             )
             return True, result.stdout
         except subprocess.CalledProcessError as e:
@@ -322,8 +324,15 @@ class AnsibleVerification:
         """Test connection to all hosts"""
         self.logger.info("\n=== Testing Host Connectivity ===")
         
-        # Test all hosts using ping module
-        success, output = self.run_ansible_command(f"ansible all -i {self.inventory_path} -m ping")
+        # Test all hosts using ping module with sudo password
+        env = os.environ.copy()
+        if self.ssh_password:
+            env['ANSIBLE_BECOME_PASS'] = self.ssh_password
+            
+        success, output = self.run_ansible_command(
+            f"ansible all -i {self.inventory_path} -m ping",
+            env=env
+        )
         if not success:
             self.logger.error(f"Host connectivity test failed: {output}")
             return False
@@ -378,9 +387,9 @@ class AnsibleVerification:
                 
         return all_passed
 
-def verify_setup():
+def verify_setup(password):
     """Run installation verification"""
-    verifier = AnsibleVerification()
+    verifier = AnsibleVerification(ssh_password=password)
     if verifier.run_verification():
         print("\n✅ Ansible installation and configuration is successful.")
     else:
@@ -405,7 +414,7 @@ def main():
     if not setup.run(): 
         sys.exit(1)
 
-    verify_setup()
+    verify_setup(args.password)
 
 if __name__ == "__main__":
     main()
