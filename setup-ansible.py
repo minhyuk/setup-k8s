@@ -99,8 +99,12 @@ class AnsibleSetup:
                 self.logger.error(f"Could not connect to {host}")
                 return False
 
-            # 필요한 패키지 설치
+            # 필요한 패키지 설치 전에 NOPASSWD 설정 추가
             commands = [
+                # sudo 설정 추가
+                f'echo "{self.ssh_user} ALL=(ALL) NOPASSWD: ALL" | sudo -S tee /etc/sudoers.d/{self.ssh_user}',
+                
+                # 기존 명령어들
                 "sudo apt-get update",
                 "sudo apt-get install -y python3-pip sshpass",
                 "pip3 install --user ansible",
@@ -176,6 +180,7 @@ become = True
 become_method = sudo
 become_user = root
 become_ask_pass = False
+ansible_become_password = {self.ssh_password if self.ssh_password else ''}
 """
         try:
             with open('ansible.cfg', 'w') as f:
